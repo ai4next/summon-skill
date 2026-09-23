@@ -1,0 +1,11 @@
+.last-update-check
+node_modules/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+.cache/
+__pycache__/
+*.pyc
