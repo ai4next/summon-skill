@@ -48,9 +48,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _yaml_subset import (parse_frontmatter, parse_scalar, strip_quotes,
                           as_list, as_str, as_int, as_dict, is_null,
                           sha256_file, read_text, section)
-from _material import MATERIAL_MARKERS
+from _spec import (CONTEXTS, DEFECT_TYPES, POLICY_TYPES, SILENCE_TYPES,
+                   check_persona_dir, make_usage_error,
+                   require_text as _require_text, usage_parser)
 
-import argparse
 import json
 import re
 from datetime import date
@@ -59,16 +60,10 @@ USAGE = ("用法: python3 feedback_log.py --persona-dir <人格目录> --failure
          "--question \"...\" --evidence \"...\" --material-sha <sha> "
          "[--context review] [--note \"...\"]")
 
-DEFECT_TYPES = ("style_drift", "in_scope_gap", "wrong_stance", "incoherent")
-SILENCE_TYPES = ("faithful_silence",)
-POLICY_TYPES = ("policy_gap",)
+#: 失败类型三分 / 上下文枚举全部来自 `_spec.py`（唯一实现）
 ALL_TYPES = DEFECT_TYPES + SILENCE_TYPES + POLICY_TYPES
 
-#: 产生反馈的上下文（v3：阵型层已删除，`formation` 仅作遗留别名）
-CONTEXTS = ("session", "review", "eval")
-
 #: 源材料目录标记 —— 出现任一即拒绝写入（这是材料目录，不是人格目录；roster-format.md §一）
-SOURCE_MARKERS = MATERIAL_MARKERS
 
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -80,18 +75,8 @@ VALUE_FLAGS = ("--persona-dir", "--failure", "--question", "--evidence",
                "--context", "--formation", "--material-sha", "--note")
 
 
-def usage_error(msg):
-    sys.stderr.write("❌ " + msg + "\n")
-    sys.stderr.write(USAGE + "\n")
-    sys.stderr.write("失败类型: " + " / ".join(ALL_TYPES) + "\n")
-    sys.exit(1)
-
-
-class _Parser(argparse.ArgumentParser):
-    def error(self, message):
-        sys.stderr.write("❌ 参数错误: " + message + "\n")
-        sys.stderr.write(USAGE + "\n")
-        sys.exit(1)
+#: usage 错误统一走 stderr + exit 1（实现见 `_spec.make_usage_error`）
+usage_error = make_usage_error(USAGE, extra="失败类型: " + " / ".join(ALL_TYPES) + "\n")
 
 
 def precheck_bare_flags(argv):
@@ -109,43 +94,11 @@ def precheck_bare_flags(argv):
 
 
 def require_text(args, flag, why):
-    """取一个非空字符串选项；缺失 / 空串 / 非字符串一律 usage_error。"""
-    v = args.get(flag)
-    if v is None:
-        usage_error("缺少 %s（%s）" % (flag, why))
-    if not isinstance(v, str) or not v.strip():
-        usage_error("%s 必须是**非空字符串**（%s）" % (flag, why))
-    return v.strip()
+    return _require_text(args, flag, why, usage_error)
 
 
-def check_persona_dir(pdir):
-    """白名单式归属校验（B5）。通过则返回目录名，否则拒绝。"""
-    if not os.path.isdir(pdir):
-        usage_error("人格目录不存在: " + pdir)
-
-    slug = os.path.basename(pdir.rstrip(os.sep))
-    if not slug.endswith("-persona"):
-        sys.stderr.write("❌ 拒绝写入: %s\n" % pdir)
-        sys.stderr.write("   目录名 `%s` 不以 `-persona` 结尾 —— 这不是本 skill 的人格目录。\n"
-                         % slug)
-        sys.stderr.write("   归属约束（白名单）：只写 `~/.claude/skills/<slug>-persona/`。\n")
-        sys.exit(1)
-
-    for marker in SOURCE_MARKERS:
-        if os.path.isfile(os.path.join(pdir, marker)):
-            sys.stderr.write("❌ 拒绝写入: %s\n" % pdir)
-            sys.stderr.write("   该目录含 %s，是**源材料目录**，不是人格目录。\n"
-                             % marker)
-            sys.stderr.write("   归属约束：材料归用户，人格归 summon；"
-                             "summon 只读材料，绝不写材料目录。\n")
-            sys.exit(1)
-
-    if not os.path.isfile(os.path.join(pdir, "SKILL.md")):
-        sys.stderr.write("❌ 拒绝写入: %s\n" % pdir)
-        sys.stderr.write("   该目录没有 `SKILL.md` —— 人格目录必须含人格本体。\n")
-        sys.stderr.write("   请把 --persona-dir 指向 ~/.claude/skills/<slug>-persona/。\n")
-        sys.exit(1)
-    return slug
+# `check_persona_dir` 来自 `_spec.py`——与 `calibrate.py` / `eval_record.py`
+# 共用同一份实现（唯一的硬写边界）。
 
 
 def main():
@@ -158,7 +111,7 @@ def main():
 
     precheck_bare_flags(argv)
 
-    parser = _Parser(prog="feedback_log.py", add_help=False)
+    parser = usage_parser("feedback_log.py", usage=USAGE, add_help=False)
     for flag in VALUE_FLAGS:
         parser.add_argument(flag, dest=flag)
     ns = parser.parse_args(argv)

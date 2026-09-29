@@ -57,8 +57,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _yaml_subset import (parse_frontmatter, parse_scalar, strip_quotes,
                           as_list, as_str, as_int, as_dict, is_null,
                           sha256_file, read_text, section)
+from _spec import (AXES, AXIS_MAX, AXIS_REDLINE, NOISE_BAND, TOTAL_THRESHOLD,
+                   grade_of, make_usage_error, refuse_material_dir, usage_parser)
 
-import argparse
 import json
 import unicodedata
 from datetime import datetime, timezone
@@ -66,16 +67,8 @@ from datetime import datetime, timezone
 USAGE = ("用法: python3 eval_record.py {record|history|compare} --file <EVALS.jsonl> "
          "[--json '<JSON>'] [--from-file <文件>] [--noise 10]")
 
-NOISE_BAND = 10   # 与评分卡「分差 >10 分需复核」保持一致
-TOTAL_THRESHOLD = 70
-
-#: 四轴（名称, 满分）——顺序即报表顺序（`fidelity-scorecard.md` §零）
-AXES = (("生成力", 30), ("自洽性", 25), ("辨识度", 20), ("溯源", 25))
+#: 四轴 / 红线 / 门槛 / 噪声带全部来自 `_spec.py`（唯一实现）
 AXIS_NAMES = tuple(n for n, _ in AXES)
-AXIS_MAX = dict(AXES)
-
-#: 分轴红线（§五）：S=0 直接判 D；C<15 / D<12 最高判 C；G<12 标复读机
-AXIS_REDLINE = {"生成力": 12, "自洽性": 15, "辨识度": 12, "溯源": 0}
 
 #: 需要跟值的选项：裸写（后面没值）必须当场拒绝，绝不能变成 Python `True`
 VALUE_FLAGS = ("--file", "--json", "--from-file", "--noise")
@@ -83,17 +76,8 @@ VALUE_FLAGS = ("--file", "--json", "--from-file", "--noise")
 EXIT_REFUSED = 2
 
 
-def usage_error(msg):
-    sys.stderr.write("❌ " + msg + "\n")
-    sys.stderr.write(USAGE + "\n")
-    sys.exit(1)
-
-
-class _Parser(argparse.ArgumentParser):
-    def error(self, message):
-        sys.stderr.write("❌ 参数错误: " + message + "\n")
-        sys.stderr.write(USAGE + "\n")
-        sys.exit(1)
+#: usage 错误统一走 stderr + exit 1（实现见 `_spec.make_usage_error`）
+usage_error = make_usage_error(USAGE)
 
 
 def precheck_bare_flags(argv):
@@ -222,10 +206,6 @@ def get_mode(rec):
     return m
 
 
-def grade_of(score):
-    return "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 55 else "D"
-
-
 def get_scorers(rec):
     """E1：`scorers` 可能是字符串（如 "2"）——统一 as_int，比较/运算不再崩。"""
     return as_int(rec.get("scorers"))
@@ -254,6 +234,9 @@ def cmd_record(args):
     if not isinstance(path, str) or not path.strip():
         usage_error("record 需要 --file（EVALS.jsonl 路径）")
     path = path.strip()
+    # 写边界：材料归用户，人格归 summon。`--file` 是显式路径，不必是人格目录，
+    # 但**绝不能落在用户的材料目录里**（roster-format.md §一）。
+    refuse_material_dir(path)
 
     raw = args.get("--json")
     if raw is not None and not isinstance(raw, str):
@@ -567,7 +550,7 @@ def main():
 
     precheck_bare_flags(argv)
 
-    parser = _Parser(prog="eval_record.py", add_help=False)
+    parser = usage_parser("eval_record.py", usage=USAGE, add_help=False)
     sub = parser.add_subparsers(dest="cmd")
 
     p_rec = sub.add_parser("record", add_help=False)

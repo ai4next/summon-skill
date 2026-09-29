@@ -18,7 +18,7 @@
     0 = 无 FAIL（警告不阻塞）
     1 = 有 FAIL，或参数有误
 
-十一项检查:
+十五项检查:
      1. 引用文件存在性      活跃 markdown 里内联代码的 references/*.md、scripts/*.py、examples/* 是否存在
      2. 废弃术语            活跃文档（SKILL.md / README.md / references/*.md）不得把 四阵型 / 圆桌 / 遣将 / panel / 主持人 / 原型型 当作**功能**描述
      3. 路由表完整性        SKILL.md §四 路由表点名的 canonical source 是否存在
@@ -30,6 +30,14 @@
      9. slug 一致性         示例人格 slug 在所有 *.md 里拼写一致（防 skeptic / skeptical 漂移）
      10. 文档 / 脚本契约     roster.py 只读、SKILL.md 不声称脚本没有的能力、点名的 references 存在
      11. CI 存在性          .github/workflows/ci.yml 存在且跑 selfcheck.py 与测试
+     12. 常量一致性          四轴分值 / 等级线 / 门槛 / 红线 / 张力门禁在 `_spec.py` 与文档之间一致，
+                            且没有别的脚本再硬编码这些数值
+     13. 概念重复（指针纪律） 活跃文档之间不得有连续 4 行以上的逐字重复
+                            （design-philosophy.md §四：「漂移的根因是复制」）
+     14. 声明的脚本行为存在 文档写着「`X.py` 会核 Y」时，X.py 里必须真的能找到 Y 的实现
+                            （空头支票会让读者以为有机器在守，而那条纪律就真的没人守了）
+     15. 示例哈希声明一致   示例人格文档里写出的 sha256 前缀必须与实际文件对得上
+                            （曾出现同一个文件里两个哈希不一致，而 CI 全绿）
 
 检查 1 的解析范围：只认**仓库内**引用。人格目录内的 `references/AXIOMS.md`（相对于
 `*-persona/` 解析）不算悬空；**外部链接**（`http(s)://` / 明说「另一个仓库」）也不校验——
@@ -55,8 +63,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _yaml_subset import parse_frontmatter, as_dict, as_int, as_str, is_null  # noqa: E402
+from _yaml_subset import (parse_frontmatter, as_dict, as_int, as_str, is_null,
+                          sha256_file)  # noqa: E402
 from _material import FIELD_SOURCE  # noqa: E402
+from _spec import (AXES, AXIS_LETTER, AXIS_REDLINE, GRADE_CUTOFFS,
+                   TENSION_MIN_GATE, TENSION_MIN_TARGET, TOTAL_THRESHOLD,
+                   make_usage_error)  # noqa: E402
 
 INLINE = re.compile(r"`([^`\n]+)`")
 LOCAL_PATH_RE = re.compile(r"(?<![\w/.-])((?:references|scripts|examples)/[A-Za-z0-9._/-]+)")
@@ -70,8 +82,7 @@ STALE_EXEMPT_RE = re.compile(r"(删除|已删除|不做|不提供|曾经|迁移|
 #: 「活跃文档」= 受机械契约约束的 markdown；`examples/`（示例产物）不算
 ACTIVE_DOCS = ("SKILL.md", "README.md")
 
-#: 四轴（名称, 满分）——与 `fidelity-scorecard.md` 一致
-AXES = (("生成力", 30), ("自洽性", 25), ("辨识度", 20), ("溯源", 25))
+#: 四轴（`AXES`）来自 `_spec.py`（唯一实现）——本文件不复制数值常量。
 
 #: 只读脚本：任何 markdown 不得声称它会写文件
 READONLY_SCRIPTS = ("roster.py",)
@@ -83,10 +94,9 @@ WRITE_NEGATION_RE = re.compile(r"(不写|只读|不修改|不自动改|只打印
 # 基础工具
 # --------------------------------------------------------------------------
 
-def usage_error(msg):
-    sys.stderr.write("❌ " + msg + "\n")
-    sys.stderr.write("用法: python3 selfcheck.py [--root DIR] [--json] [--quiet]\n")
-    sys.exit(1)
+#: 参数错误统一走 stderr + exit 1（实现见 `_spec.make_usage_error`）
+usage_error = make_usage_error(
+    "用法: python3 selfcheck.py [--root DIR] [--json] [--quiet]")
 
 
 def _read(path):
@@ -205,7 +215,7 @@ def _md_section(text, marker):
 
 
 def _roster_field_issues(fm):
-    """→ (missing, warnings)。名册必填字段（合成型以公理集替代 `source_material`，见 persona-forge.md §七.3）。
+    """→ (missing, warnings)。名册必填字段（合成型以公理集替代 `source_material`，见 persona-forge.md §3.1）。
 
     v3：`axes`（四轴内联映射）取代 v2 的 `fidelity` / `generativity`；旧字段仍被接受，
     但记一条 ⚠️ 弃用警告（不算 FAIL）。
@@ -634,6 +644,270 @@ def check_ci_presence(root):
 
 
 # --------------------------------------------------------------------------
+# 检查 12：常量一致性（四轴分值 / 等级线 / 门槛 / 红线 / 张力门禁）
+# --------------------------------------------------------------------------
+
+def check_constant_consistency(root):
+    """`_spec.py` 是数值常量的**唯一实现**——文档与其他脚本都不得与之不一致。
+
+    这一项针对的是一类具体的历史故障：四轴满分曾在 4 个脚本 + 4 处文档里各写一遍，
+    张力门槛在 5 处文档里是 `≥2`、在评分卡与脚本里是 `≥1`。
+    改一次分值要改八处，而没有任何检查会发现漏改。
+    """
+    problems = []
+
+    # ---- 1) 其他脚本不得再硬编码四轴分值 ----
+    for sp in _iter_scripts(root):
+        base = os.path.basename(sp)
+        if base == "_spec.py":
+            continue
+        text = _read(sp)
+        for name, mx in AXES:
+            if re.search(r'["\']%s["\']\s*,\s*%d\b' % (re.escape(name), mx), text):
+                problems.append(
+                    "scripts/%s 硬编码了四轴分值（`%s`, %d）——应 `from _spec import AXES`"
+                    % (base, name, mx))
+
+    # ---- 2) 评分卡：四轴满分表 ----
+    sc_path = os.path.join(root, "references", "fidelity-scorecard.md")
+    if not os.path.isfile(sc_path):
+        problems.append("references/fidelity-scorecard.md 不存在——四轴的 canonical source 缺失")
+        return (not problems), problems
+    sc = _read(sc_path)
+    for name, mx in AXES:
+        m = re.search(r"\|\s*\*\*%s\s+[A-Z]\*\*\s*\|\s*\*\*(\d+)\*\*" % re.escape(name), sc)
+        if not m:
+            problems.append("fidelity-scorecard.md 的轴表里找不到「%s」的满分——格式变了？" % name)
+        elif int(m.group(1)) != mx:
+            problems.append("fidelity-scorecard.md 说「%s」满分 %s，`_spec.py` 说 %d"
+                            % (name, m.group(1), mx))
+
+    # ---- 3) 评分卡：等级线 ----
+    for name, floor in GRADE_CUTOFFS:
+        m = re.search(r"\|\s*\*\*%s\*\*\s*\|\s*[≥<]?\s*(\d+)" % name, sc)
+        if not m:
+            problems.append("fidelity-scorecard.md 的等级表里找不到「%s」——格式变了？" % name)
+        elif int(m.group(1)) != floor:
+            problems.append("fidelity-scorecard.md 说等级 %s 的线是 %s，`_spec.py` 说 %d"
+                            % (name, m.group(1), floor))
+
+    # ---- 4) 评分卡：分轴红线 ----
+    for axis, red in AXIS_REDLINE.items():
+        letter = AXIS_LETTER[axis]
+        if red == 0:
+            continue          # 溯源 S=0 的写法是 `S = 0`，单独核
+        m = re.search(r"%s\s*%s\s*<\s*(\d+)" % (re.escape(axis), letter), sc)
+        if not m:
+            problems.append("fidelity-scorecard.md 的红线段里找不到「%s %s<…」" % (axis, letter))
+        elif int(m.group(1)) != red:
+            problems.append("fidelity-scorecard.md 说「%s %s<%s」，`_spec.py` 说 <%d"
+                            % (axis, letter, m.group(1), red))
+    if not re.search(r"溯源\s*S\s*=\s*0", sc):
+        problems.append("fidelity-scorecard.md 的红线段里找不到「溯源 S = 0 → 判 D」")
+
+    # ---- 5) 名册规范：可用门槛 ----
+    rf_path = os.path.join(root, "references", "roster-format.md")
+    if os.path.isfile(rf_path):
+        rf = _read(rf_path)
+        m = re.search(r"`total`\s*≥\s*(\d+)", rf)
+        if not m:
+            problems.append("roster-format.md 里找不到「`total` ≥ N」的门槛表述")
+        elif int(m.group(1)) != TOTAL_THRESHOLD:
+            problems.append("roster-format.md 说可用门槛是 %s，`_spec.py` 说 %d"
+                            % (m.group(1), TOTAL_THRESHOLD))
+
+    # ---- 6) 张力门槛：文档里的数字必须落在 {硬门禁, 质量目标} 内 ----
+    allowed = {TENSION_MIN_GATE, TENSION_MIN_TARGET}
+    for md in _active_doc_paths(root):
+        for lineno, line in enumerate(_read(md).splitlines(), 1):
+            for m in re.finditer(r"(?:至少|≥)\s*(\d+)\s*对[^\n]{0,6}张力", line):
+                n = int(m.group(1))
+                if n not in allowed:
+                    problems.append(
+                        "%s:%d 说张力门槛是 %d 对，但 `_spec.py` 只允许 %s"
+                        % (_rel(root, md), lineno, n, " / ".join(map(str, sorted(allowed)))))
+    return (not problems), _dedupe(problems)
+
+
+# --------------------------------------------------------------------------
+# 检查 13：概念重复（`design-philosophy.md` §四 的「指针纪律」）
+# --------------------------------------------------------------------------
+
+#: 连续多少行逐字相同才算「复制」（低于此值多为表格表头/分隔行的偶然撞车）
+DUP_RUN_MIN = 4
+
+#: 低于此长度的行不参与比对（表头、分隔行、空行）
+DUP_LINE_MIN = 8
+
+
+def _significant_lines(text):
+    """→ [(行号, 归一化文本)]，剔除代码块与琐碎行。
+
+    代码块整段跳过：spawn 出去的 prompt **必须内联**（`design-philosophy.md` §四
+    的例外条款），那不是漂移，是设计要求。
+    """
+    out, in_fence = [], False
+    for lineno, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if len(s) < DUP_LINE_MIN:
+            continue
+        if re.match(r"^\|[\s:|-]+\|$", s):      # 表格分隔行
+            continue
+        out.append((lineno, s))
+    return out
+
+
+def check_no_duplicated_blocks(root):
+    """活跃文档之间不得有 `DUP_RUN_MIN` 行以上的**逐字重复**。
+
+    `design-philosophy.md` §四：「**漂移的根因是复制，不是写错。** 任何概念在第二处
+    出现时，只能写成指针；写成表格就会漂移。」该节末尾声称
+    「`scripts/selfcheck.py` 会机械检查这条纪律」——本检查就是那句话的实现。
+    （此前它只是一句声明，没有任何实现，于是 README 与 SKILL.md 真的复制出了两处漂移。）
+    """
+    docs = []
+    for md in _active_doc_paths(root):
+        docs.append((_rel(root, md), _significant_lines(_read(md))))
+
+    problems = []
+    for i in range(len(docs)):
+        for j in range(i + 1, len(docs)):
+            name_a, lines_a = docs[i]
+            name_b, lines_b = docs[j]
+            index_b = {}
+            for k, (_ln, s) in enumerate(lines_b):
+                index_b.setdefault(s, []).append(k)
+            k = 0
+            while k < len(lines_a):
+                hits = index_b.get(lines_a[k][1])
+                if not hits:
+                    k += 1
+                    continue
+                best = 0
+                for h in hits:
+                    run = 0
+                    while (k + run < len(lines_a) and h + run < len(lines_b)
+                           and lines_a[k + run][1] == lines_b[h + run][1]):
+                        run += 1
+                    best = max(best, run)
+                if best >= DUP_RUN_MIN:
+                    problems.append(
+                        "%s:%d 与 %s:%d 有 %d 行逐字重复 —— 概念只许在 canonical source "
+                        "定义一次，第二处写成指针（design-philosophy.md §四）"
+                        % (name_a, lines_a[k][0], name_b, lines_b[h][0], best))
+                    k += best
+                else:
+                    k += 1
+    return (not problems), _dedupe(problems)
+
+
+# --------------------------------------------------------------------------
+# 检查 14：文档声称的脚本行为必须真的存在
+# --------------------------------------------------------------------------
+
+#: 文档里「某脚本会做 X」的声明 → 该脚本里必须能找到实现。
+#: 形状：`(文档路径, 声明的正则, 目标脚本, 实现标记的正则, 人话)`
+#:
+#: 为什么需要这一项：仓库有三处写着「`X.py` 会核 / 会机械检查 Y」，而实现并不存在。
+#: 读者据此以为有机器在守，于是那条纪律真的被违反了（README/SKILL.md 的逐字重复
+#: 就是「selfcheck 会机械检查指针纪律」这句空头支票的产物）。
+#: 这份清单是**显式的**：新增一句这类声明，就往这里加一行。
+CLAIMED_BEHAVIORS = (
+    ("references/roster-format.md",
+     r"`scripts/selfcheck\.py` 会机械检查「任何文档都不得声称 `roster\.py` 会写文件」",
+     "scripts/selfcheck.py", r"roster\.py.*(?:写|生成)|WRITE_CLAIM_RE", "roster 只读声明"),
+    ("references/roster-format.md",
+     r"`roster\.py` 会报告它的「生效中」条数",
+     "scripts/roster.py", r"calib", "校准生效中条数"),
+    ("references/persona-template.md",
+     r"`scripts/selfcheck\.py` 会机械检查这条纪律",
+     "scripts/selfcheck.py", r"def check_no_duplicate_parsers\b", "frontmatter 解析器唯一性"),
+    ("references/persona-template.md",
+     r"`fidelity_check\.py` 会逐条核",
+     "scripts/fidelity_check.py", r"def check_provenance\b", "src: 溯源指针"),
+    ("references/persona-template.md",
+     r"`roster\.py` 会检测重叠与子串包含",
+     "scripts/roster.py", r"def find_conflicts\b", "触发词重叠"),
+    ("references/persona-forge.md",
+     r"`fidelity_check\.py` 会核",
+     "scripts/fidelity_check.py", r"失效条件|失效\|反例", "启发式的失效条件"),
+    ("references/design-philosophy.md",
+     r"`scripts/selfcheck\.py` 会机械检查这条纪律",
+     "scripts/selfcheck.py", r"def check_no_duplicated_blocks\b", "概念重复（指针纪律）"),
+)
+
+
+def check_claimed_behaviors(root):
+    """文档说「某脚本会做 X」时，X 必须真的在脚本里。"""
+    problems = []
+    for doc_rel, claim_re, script_rel, impl_re, label in CLAIMED_BEHAVIORS:
+        doc_path = os.path.join(root, doc_rel)
+        script_path = os.path.join(root, script_rel)
+        if not os.path.isfile(doc_path):
+            problems.append("声明登记表里的文档不存在：%s" % doc_rel)
+            continue
+        if not re.search(claim_re, _read(doc_path)):
+            problems.append(
+                "%s 里已找不到声明「%s」——声明改了就同步更新 selfcheck 的 CLAIMED_BEHAVIORS"
+                % (doc_rel, label))
+            continue
+        if not os.path.isfile(script_path):
+            problems.append("声明登记表里的脚本不存在：%s" % script_rel)
+            continue
+        if not re.search(impl_re, _read(script_path)):
+            problems.append(
+                "%s 声称「%s 会做「%s」」，但 %s 里找不到对应实现 —— "
+                "要么实现它，要么删掉那句声明（空头支票会让读者以为有机器在守）"
+                % (doc_rel, script_rel, label, script_rel))
+    return (not problems), _dedupe(problems)
+
+
+# --------------------------------------------------------------------------
+# 检查 15：示例里的 sha256 声明必须与实际文件一致
+# --------------------------------------------------------------------------
+
+#: `@ sha256 61dc23…` / `sha256: <hex>` 这类**声明式**哈希（前后 6 位以上十六进制）
+SHA_CLAIM_RE = re.compile(r"sha256\s*[:：]?\s*`?\s*([0-9a-fA-F]{6,64})")
+
+
+def check_hash_claims(root):
+    """示例人格文档里写出的 sha256 前缀，必须与实际文件对得上。
+
+    历史教训：`examples/skeptic-cfo-persona/SKILL.md` 的 footer 写着
+    `@ sha256 4baf96…`，而 `references/AXIOMS.md` 的真实哈希是 `61dc23b6…`
+    （frontmatter 与 `FIDELITY.md` 都是对的）——**同一个文件里两个哈希不一致，CI 全绿**。
+    哈希是漂移检测的唯一依据，写错就等于漂移检测失效。
+    """
+    ex = os.path.join(root, "examples")
+    if not os.path.isdir(ex):
+        return True, []
+    problems = []
+    for name in sorted(os.listdir(ex)):
+        pdir = os.path.join(ex, name)
+        axioms = os.path.join(pdir, "references", "AXIOMS.md")
+        if not (name.endswith("-persona") and os.path.isfile(axioms)):
+            continue
+        try:
+            actual = sha256_file(axioms)
+        except OSError as e:
+            problems.append("%s/references/AXIOMS.md 读取失败: %s" % (name, e))
+            continue
+        for md in _iter_md(pdir):
+            for lineno, line in enumerate(_read(md).splitlines(), 1):
+                for claimed in SHA_CLAIM_RE.findall(line):
+                    if not actual.startswith(claimed.lower()):
+                        problems.append(
+                            "%s:%d 声称 sha256 `%s…`，但 references/AXIOMS.md 实际是 `%s…`"
+                            % (_rel(root, md), lineno, claimed[:8], actual[:8]))
+    return (not problems), _dedupe(problems)
+
+
+# --------------------------------------------------------------------------
 
 CHECKS = [
     ("引用文件存在性", check_referenced_files),
@@ -647,6 +921,10 @@ CHECKS = [
     ("slug 一致性", check_slug_consistency),
     ("文档 / 脚本契约", check_doc_script_contract),
     ("CI 存在性", check_ci_presence),
+    ("常量一致性", check_constant_consistency),
+    ("概念重复（指针纪律）", check_no_duplicated_blocks),
+    ("声明的脚本行为存在", check_claimed_behaviors),
+    ("示例哈希声明一致", check_hash_claims),
 ]
 
 

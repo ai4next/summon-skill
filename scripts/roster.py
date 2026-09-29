@@ -30,13 +30,16 @@
 
 漂移检测（§五）:
     重算 `<source-dir>/<slug>/MATERIAL.md` 的 sha256，与 frontmatter 的
-    `source_material_sha256` 比对。材料不在本地 → 记 `stale`（不是「—」）。
-    合成型（`archetype`）对 `source_axioms` 指向的公理集文件做同样的哈希比对；
-    找不到公理集时报 `none`（**不是降级**）。
+    `source_material_sha256` 比对。漂移状态四种：
+      `ok` 一致 · `stale` 真漂移 · `unknown` 记过哈希但文件已不在（**不谎报 stale**）
+      · `none` 从没记过哈希（通用输入，不是缺陷）。
+    合成型（`archetype`）对 `source_axioms` 指向的公理集文件做同样的哈希比对。
 
 状态判定（§四）:
     `status: active` 但质检总分缺失或 < 70 → 实际状态降级为 `draft` 并告警；
-    材料哈希不一致或材料不在本地 → `stale`。**只报告，不改写文件。**
+    漂移状态为 `stale` **或 `unknown`** → 实际状态降级为 `stale`
+    ——「无法验证 ≠ 已验证」：根已经找不到的人格不该继续挂在 `active`。
+    **只报告，不改写文件。**
 
 只读不写：本脚本**不创建、不修改任何文件**（包括不写 `ROSTER.md`）。
 """
@@ -47,8 +50,11 @@ from _yaml_subset import (parse_frontmatter, as_list, as_str, as_int, as_dict,
                           is_null, sha256_file, read_text)
 from _material import (FIELD_SHA256, FIELD_SOURCE, FIELD_VERSION, SOURCE_DIR_DEFAULT,
                        material_sha, material_path as resolve_material_path)
+from _spec import (AXES, AXIS_MAX, AXES_TOTAL, CALIBRATION_LIMIT, DEFECT_TYPES,
+                   G_THRESHOLD, PERSONA_SUFFIX, POLICY_TYPES, SILENCE_TYPES,
+                   TOTAL_THRESHOLD, axis_redlines, grade_of, make_usage_error,
+                   resolve_axioms_path, usage_parser)
 
-import argparse
 import json
 import re
 
@@ -63,35 +69,16 @@ REQUIRED_FIELDS = ("name", "persona_type", "source_material",
 #: 输入是通用的（`design-philosophy.md` §零），材料可以只是一段粘贴的文本。
 OPTIONAL_MATERIAL_FIELDS = ("source_material_sha256", "source_material_version")
 
-DEFECT_TYPES = ("style_drift", "in_scope_gap", "wrong_stance", "incoherent")
-SILENCE_TYPES = ("faithful_silence",)
-POLICY_TYPES = ("policy_gap",)
-CALIBRATION_LIMIT = 10
-FIDELITY_THRESHOLD = 70
-G_THRESHOLD = 12
-
-#: 四轴（名称, 满分）——顺序即报表顺序（`fidelity-scorecard.md` §零）
-AXES = (("生成力", 30), ("自洽性", 25), ("辨识度", 20), ("溯源", 25))
+#: 四轴 / 红线 / 门槛 / 枚举全部来自 `_spec.py`（唯一实现）。
+#: 本文件不再复制任何数值常量——复制是漂移的根因（`selfcheck.py` 会机械检查）。
 
 
 # --------------------------------------------------------------------------
 # 输出工具
 # --------------------------------------------------------------------------
 
-def usage_error(msg):
-    sys.stderr.write("❌ " + msg + "\n")
-    sys.stderr.write(USAGE + "\n")
-    sys.exit(1)
-
-
-class _Parser(argparse.ArgumentParser):
-    """argparse 的 usage 错误统一走 stderr + exit 1（默认是 exit 2）。"""
-
-    def error(self, message):
-        self.print_usage(sys.stderr)
-        sys.stderr.write("❌ " + message + "\n")
-        sys.exit(1)
-
+#: usage 错误统一走 stderr + exit 1（实现见 `_spec.make_usage_error`）
+usage_error = make_usage_error(USAGE)
 
 # --------------------------------------------------------------------------
 # FIDELITY.md（四轴；兼容旧的 F/G 两轴与 v1 总分表头）
@@ -109,10 +96,6 @@ AXIS_RES = {
 TOTAL_RE = re.compile(r"(?:总分|保真度\s*F)\s*[:：]\s*(\d+)\s*/\s*100")
 GRADE_RE = re.compile(r"等级\s*\**\s*[:：]?\s*\**\s*([ABCD])")
 MODE_RE = re.compile(r"mode\s*\**\s*[:：]\s*\**\s*(full|lite)\b", re.I)
-
-
-def grade_of(score):
-    return "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 55 else "D"
 
 
 def read_fidelity(path):
@@ -317,40 +300,6 @@ def _split_list(v):
 # 漂移（R7）
 # --------------------------------------------------------------------------
 
-def resolve_axioms_path(fm, persona_dir, source_root, slug):
-    """合成型（`archetype`）的 `source_axioms` → 实际文件路径。
-
-    解析顺序（`persona-forge.md` §七：公理集惯例放在**人格目录自己的** `references/AXIOMS.md`，
-    这样人格目录是自包含、可迁移的）：
-      1. 绝对路径
-      2. 含 `/` 或以 `.md` 结尾 → 相对**人格目录**
-      3. slug 形式 → `<人格目录>/references/AXIOMS.md` → `<源材料根>/<slug>/AXIOMS.md` → `<人格目录>/<slug>`
-      4. 兜底：即使 frontmatter 没写，人格目录下的 `references/AXIOMS.md` 也算数
-
-    返回 None 表示「这个合成型确实没有公理集」（→ 报 none，不是 stale）。
-    """
-    raw = as_str(fm.get("source_axioms"))
-    conv = os.path.join(persona_dir, "references", "AXIOMS.md")
-    candidates = []
-    if raw:
-        if os.path.isabs(raw):
-            candidates.append(raw)
-        elif "/" in raw or raw.endswith(".md"):
-            candidates.append(os.path.join(persona_dir, raw))
-        else:
-            candidates += [conv,
-                           os.path.join(source_root, raw, "AXIOMS.md"),
-                           os.path.join(persona_dir, raw)]
-    if os.path.isfile(conv):
-        candidates.append(conv)
-    if not candidates:
-        return None
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return candidates[0]
-
-
 def compute_drift(ptype, slug, recorded, fm, persona_dir, source_root):
     """→ (state, detail)。state ∈ ok / stale / unknown / none。
 
@@ -520,7 +469,9 @@ def collect(skills_dir, source_root):
         rec["declared"] = declared
         eff = declared
         if declared != "retired":
-            if rec["drift"] == "stale":
+            if rec["drift"] in ("stale", "unknown"):
+                # `unknown`（记过哈希但根已找不到）同样降级：无法验证 ≠ 已验证。
+                # 但措辞必须如实——`unknown` **不是**「检测到漂移」，不写「建议重铸」。
                 eff = "stale"
                 rec["warnings"].append(
                     "状态降级: `%s` → `stale`（%s）" % (declared, rec["drift_detail"]))
@@ -529,11 +480,11 @@ def collect(skills_dir, source_root):
                 rec["warnings"].append(
                     "状态降级: `active` → `draft`（质检总分缺失：FIDELITY.md 与 "
                     "frontmatter `axes` 都没给出 total）")
-            elif declared == "active" and rec["fid"]["score"] < FIDELITY_THRESHOLD:
+            elif declared == "active" and rec["fid"]["score"] < TOTAL_THRESHOLD:
                 eff = "draft"
                 rec["warnings"].append(
                     "状态降级: `active` → `draft`（质检总分 %d < B/%d）"
-                    % (rec["fid"]["score"], FIDELITY_THRESHOLD))
+                    % (rec["fid"]["score"], TOTAL_THRESHOLD))
         rec["effective"] = eff
         rows.append(rec)
 
@@ -576,19 +527,15 @@ def _axis_line(f):
 
 
 def _axis_flags(f):
-    """按 `fidelity-scorecard.md` §五 的红线给单个人格标旗。"""
+    """按 `fidelity-scorecard.md` §五 的红线给单个人格标旗。
+
+    红线的**数值**来自 `_spec.AXIS_REDLINE`（唯一实现）——本文件只负责渲染。
+    """
     flags = []
-    if f["score"] is not None and f["score"] < FIDELITY_THRESHOLD:
+    if f["score"] is not None and f["score"] < TOTAL_THRESHOLD:
         flags.append("⚠️ 总分 < B")
     if f["axes_measured"]:
-        if f["axes"].get("溯源") == 0:
-            flags.append("❌ 溯源 S=0 → 判 D")
-        if f["axes"].get("自洽性", 99) < 15:
-            flags.append("⚠️ 自洽性 C<15")
-        if f["axes"].get("辨识度", 99) < 12:
-            flags.append("⚠️ 辨识度 D<12")
-        if f["axes"].get("生成力", 99) < G_THRESHOLD:
-            flags.append("⚠️ 生成力 G<%d（复读机）" % G_THRESHOLD)
+        flags.extend(axis_redlines(f["axes"]))
     else:
         flags.append("⚠️ 四轴未测，不得声称达标")
     return flags
@@ -678,7 +625,7 @@ def render(rows, rejected, trigger_map, feedback_map, skills_dir):
 
     # ---- 校准层 ----
     print("")
-    print("运行侧校准（CALIBRATION.md，见 references/calibration.md §五）")
+    print("运行侧校准（CALIBRATION.md，见 references/roster-format.md §5.4）")
     over = []
     any_calib = False
     for r in rows:
@@ -712,7 +659,7 @@ def render(rows, rejected, trigger_map, feedback_map, skills_dir):
 
     print("")
     measured = [r for r in rows if not r["status_error"] and r["fid"]["score"] is not None]
-    ok_b = [r for r in measured if r["fid"]["score"] >= FIDELITY_THRESHOLD]
+    ok_b = [r for r in measured if r["fid"]["score"] >= TOTAL_THRESHOLD]
     g_ok = [r for r in rows if not r["status_error"] and r["fid"]["axes_measured"]
             and r["fid"]["axes"].get("生成力", -1) >= G_THRESHOLD]
     print("  共 %d 个人格 · 总分 ≥B 的 %d 个 · 生成力 G ≥%d 的 %d 个（四轴分开报，不相加）"
@@ -725,7 +672,7 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    parser = _Parser(prog="roster.py", add_help=False)
+    parser = usage_parser("roster.py", add_help=False, error_prefix="❌ ")
     parser.add_argument("--skills-dir", default="~/.claude/skills")
     parser.add_argument("--source-dir", dest="source_dir", default=SOURCE_DIR_DEFAULT)
     ns = parser.parse_args(argv)

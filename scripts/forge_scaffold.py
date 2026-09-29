@@ -50,7 +50,6 @@ frontmatter（含 ground truth 哈希与 `axes` 四轴占位）、诚实边界�
     `fidelity_check.py` 会逐条核。
 """
 
-import argparse
 import os
 import re
 import sys
@@ -63,6 +62,13 @@ from _yaml_subset import (  # noqa: E402
 from _material import (  # noqa: E402
     FIELD_SHA256, FIELD_SOURCE, FIELD_VERSION, MATERIAL_FILENAME, material_path,
 )
+from _spec import (  # noqa: E402
+    AXIOMS_REL_DEFAULT, PERSONA_ENTRY, PERSONA_SUFFIX, PERSONA_TYPES,
+    usage_parser, write_text_atomic,
+)
+
+#: 公理集在人格目录内的文件名（相对路径见 `_spec.AXIOMS_REL_DEFAULT`）
+AXIOMS_BASENAME = os.path.basename(AXIOMS_REL_DEFAULT)
 
 #: 源材料里「核心骨架」段的候选标题（旧实现只找「核心框架」，因此永远落空）
 MODEL_SECTION_TITLES = ("心智模型 / 核心骨架", "核心骨架", "心智模型 / 核心框架", "心智模型")
@@ -90,6 +96,28 @@ def die(msg, code=1):
 
 def warn(msg):
     sys.stderr.write("⚠️  " + msg + "\n")
+
+
+def _copy_atomic(src, dest):
+    """原子复制文件：同目录临时文件 → `os.replace`。
+
+    `shutil.copyfile` 直接写目标路径——中途失败会留下半截文件，
+    而这里的调用场景是「`--force` 重铸一个已存在的人格」，
+    半截公理集配上旧 SKILL.md 就是哈希错配。
+    """
+    import shutil
+    tmp = os.path.join(os.path.dirname(os.path.abspath(dest)),
+                       ".%s.tmp.%d" % (os.path.basename(dest), os.getpid()))
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def extract_models(body):
@@ -299,7 +327,7 @@ status: draft
 
 **⚠️ 必须使用工具获取真实信息，不可跳过。**
 
-[**由 agent 从下方心智模型反推生成 3-6 个研究维度**——见 persona-forge.md §五]
+[**由 agent 从下方心智模型反推生成 3-6 个研究维度**——见 persona-forge.md §七]
 
 ### Step 3: [人格名]式回答
 
@@ -396,13 +424,11 @@ ground truth：`{archive}`
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        prog="forge_scaffold.py", description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = usage_parser("forge_scaffold.py", description=__doc__)
     ap.add_argument("material", nargs="?",
                     help="材料路径：**任意文件或目录**（与 --axioms / --source-desc 三选一）")
     ap.add_argument("--out", help="人格目录（必填）")
-    ap.add_argument("--type", default="real", choices=("real", "archetype", "fictional"),
+    ap.add_argument("--type", default="real", choices=PERSONA_TYPES,
                     help="人格类型（默认 real；archetype = 合成型，三条平等主路径之一）")
     ap.add_argument("--axioms", help="合成型（archetype）的立场公理集 AXIOMS.md"
                                      "（与位置参数二选一）——合成型的主路径")
@@ -421,6 +447,27 @@ def main():
         die("材料路径 / --axioms / --source-desc 三者只能给一个")
     if not args.out:
         die("缺少 --out 人格目录")
+
+    # ---- 目录名必须与产物契约一致 ----------------------------------------
+    # frontmatter 里写的是 `name: <slug>-persona`，但 `roster.py` 只扫 `-persona` 后缀，
+    # `feedback_log.py` / `calibrate.py` 也只认这个后缀。铸到 `~/.claude/skills/munger`
+    # 会得到一个**全工具链都不认**的产物，而此前没有任何警告。
+    out_base = os.path.basename(os.path.abspath(os.path.expanduser(args.out)).rstrip(os.sep))
+    if not out_base.endswith(PERSONA_SUFFIX):
+        die("--out 的目录名必须以 `%s` 结尾（现在是 `%s`）。\n"
+            "   人格目录的命名契约见 roster-format.md §二：只写 "
+            "`~/.claude/skills/<slug>%s/`。\n"
+            "   否则 roster.py 扫不到它，feedback_log / calibrate 也会拒绝写入。"
+            % (PERSONA_SUFFIX, out_base, PERSONA_SUFFIX))
+
+    # ---- 合成型必须给公理集 ----------------------------------------------
+    # 没有 --axioms 的 archetype 骨架永远过不了 P5 的 `check_axioms_present`
+    # （合成型的 ground truth 就是公理集）。CLI 不该提供一个必然失败的组合。
+    if args.type == "archetype" and not args.axioms:
+        die("合成型（--type archetype）必须给 --axioms <AXIOMS.md 路径>。\n"
+            "   合成型没有源材料，公理集就是它的 ground truth（persona-forge.md §3.1）；\n"
+            "   没有公理集的合成型无法通过 P5 静态质检。\n"
+            "   若材料只有一句主题，请先在 P3 与用户当场立定公理集，再走这一步。")
 
     is_axioms = bool(args.axioms)
     zero_file = bool(args.source_desc)
@@ -500,11 +547,12 @@ def main():
 
     axioms_rel = None
     if is_axioms:
-        # 把公理集复制进人格目录，让人格目录**自包含、可迁移**（persona-forge.md §七）
-        dest = os.path.join(out_dir, "references", "AXIOMS.md")
+        # 把公理集复制进人格目录，让人格目录**自包含、可迁移**（persona-forge.md §3.1）。
+        # 原子复制：先写同目录临时文件再 os.replace——否则中途失败会留下
+        # 「有 SKILL.md 没公理集」或「旧 SKILL.md + 新 AXIOMS.md」的哈希错配人格。
+        dest = os.path.join(out_dir, "references", AXIOMS_BASENAME)
         try:
-            import shutil
-            shutil.copyfile(src, dest)
+            _copy_atomic(src, dest)
         except OSError as e:
             die("复制公理集失败: %s" % e)
         sha = sha256_file(dest)
@@ -521,8 +569,8 @@ def main():
                               material_rel, sha, is_axioms,
                               axioms_rel, source_ref=source_ref)
     try:
-        with open(skill_path, "w", encoding="utf-8") as f:
-            f.write(skeleton)
+        # 原子写：`--force` 覆盖时中途失败会留下半截人格
+        write_text_atomic(skill_path, skeleton)
     except OSError as e:
         die("写入失败: %s" % e)
 
@@ -553,7 +601,7 @@ def main():
         print("  ⚠️  材料 gaps 为空——确认是真的无缺口，还是没写。诚实边界是地基。")
     if is_axioms and n_models == 0:
         print("")
-        print("  ⚠️  没能从 AXIOMS.md 解析出公理表——请确认格式（见 persona-forge.md §七）。")
+        print("  ⚠️  没能从 AXIOMS.md 解析出公理表——请确认格式（见 persona-forge.md §3.6）。")
 
 
 if __name__ == "__main__":

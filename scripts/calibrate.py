@@ -6,7 +6,7 @@
 这是**本地回路**：使用中暴露的运行侧问题（材料对、表现差）写在这里，**下次触发即生效**，
 不需要重铸。（材料侧问题走 `FEEDBACK.jsonl`，那是**给用户的出口**。）
 
-canonical source：`references/calibration.md`。
+canonical source：`references/roster-format.md` §5.4。
 
 用法:
     python3 calibrate.py add    --persona-dir DIR --trigger "<触发条件>" \\
@@ -20,7 +20,7 @@ canonical source：`references/calibration.md`。
     revoke   把第 N 行从「生效中」移入「已撤销」，保留历史与理由，**永不删除**
     list     打印 生效中 / 已撤销 / 待观察 计数与「生效中」各行
 
-⚠️ 最重要的约束：只许收窄，不许放宽（calibration.md §二）
+⚠️ 最重要的约束：只许收窄，不许放宽（roster-format.md §5.4）
 ================================================================
 **收窄测试（唯一判据）**：
     「这条校准让这个人在更多问题上说话，还是在更少问题上说话？」
@@ -31,14 +31,14 @@ canonical source：`references/calibration.md`。
 「更多 / 更少」是对行为语义的判断，没有可用的机械判据。
 所以本脚本只做四件事：强制 `--source`（公理 2：无出处的校准 = 意见）、
 强制 ≤10 条上限、拒绝同触发条件的重复条目、保留撤销历史。
-**收窄与否由人裁决**（`calibration.md` §二 + §六「条目须用户确认才生效」）。
+**收窄与否由人裁决**（`roster-format.md` §5.4 的收窄测试与生命周期）。
 每次 add 后请自行跑一遍上面的收窄测试。
 
 硬性规则（本脚本强制）:
     1. 归属白名单：目录名须以 `-persona` 结尾、含 `SKILL.md`，且不含源材料文件
        （`MATERIAL.md` / `manifest.json` / `QUALITY.md`——见 roster-format.md §一）
     2. `--source` 必须是**非空字符串**（公理 2：无出处的校准，违反 axiom 2）
-    3. 「生效中」≤ 10 条；第 11 条**拒绝**并提示重铸（calibration.md §五）
+    3. 「生效中」≤ 10 条；第 11 条**拒绝**并提示重铸（roster-format.md §5.4）
     4. 同触发条件的「生效中」条目已存在 → **拒绝**（本脚本不做覆盖更新；先 revoke 或改写触发条件）
     5. 撤销**只移动、不删除**，历史与理由永久保留
     6. 校准**不改材料哈希**，也**不改四轴分数**（它是运行侧收窄，不是重铸）
@@ -49,10 +49,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _yaml_subset import (parse_frontmatter, parse_scalar, strip_quotes,
                           as_list, as_str, as_int, as_dict, is_null,
                           sha256_file, read_text, section)
-from _material import (FIELD_SHA256, FIELD_SOURCE, FIELD_VERSION, MATERIAL_MARKERS,
-                       SOURCE_DIR_DEFAULT, material_path as resolve_material_path)
+from _spec import (CALIBRATION_LIMIT, check_persona_dir, make_usage_error,
+                   require_text as _require_text, usage_parser,
+                   write_text_atomic)
+from _material import (FIELD_SHA256, FIELD_SOURCE, FIELD_VERSION,                        SOURCE_DIR_DEFAULT, material_path as resolve_material_path)
 
-import argparse
 import re
 from datetime import date
 
@@ -62,11 +63,10 @@ USAGE = ("用法: python3 calibrate.py {add|revoke|list} --persona-dir DIR [...]
          "  revoke --persona-dir DIR --index N --reason \"<撤销理由>\"\n"
          "  list   --persona-dir DIR")
 
-#: calibration.md §五：生效中累计 > 10 条 → 停止追加，该重铸了
-ACTIVE_LIMIT = 10
+#: roster-format.md §5.4：生效中累计上限（数值来自 `_spec.CALIBRATION_LIMIT`）
+ACTIVE_LIMIT = CALIBRATION_LIMIT
 
 #: 源材料目录标记 —— 出现任一即拒绝（这是材料目录，不是人格目录；见 roster-format.md §一）
-SOURCE_MARKERS = MATERIAL_MARKERS
 
 CALIB_FILE = "CALIBRATION.md"
 
@@ -79,53 +79,15 @@ HEADERS = {
 }
 
 
-def usage_error(msg):
-    sys.stderr.write("❌ " + msg + "\n")
-    sys.stderr.write(USAGE + "\n")
-    sys.exit(1)
+#: usage 错误统一走 stderr + exit 1（实现见 `_spec.make_usage_error`）
+usage_error = make_usage_error(USAGE)
 
 
-class _Parser(argparse.ArgumentParser):
-    def error(self, message):
-        sys.stderr.write("❌ 参数错误: " + message + "\n")
-        sys.stderr.write(USAGE + "\n")
-        sys.exit(1)
-
-
-# --------------------------------------------------------------------------
-# 归属白名单（与 feedback_log.py B5 同一套）
-# --------------------------------------------------------------------------
-
-def check_persona_dir(pdir):
-    if not os.path.isdir(pdir):
-        usage_error("人格目录不存在: " + pdir)
-    slug = os.path.basename(pdir.rstrip(os.sep))
-    if not slug.endswith("-persona"):
-        sys.stderr.write("❌ 拒绝: %s\n" % pdir)
-        sys.stderr.write("   目录名 `%s` 不以 `-persona` 结尾 —— 这不是本 skill 的人格目录。\n"
-                         % slug)
-        sys.exit(1)
-    for marker in SOURCE_MARKERS:
-        if os.path.isfile(os.path.join(pdir, marker)):
-            sys.stderr.write("❌ 拒绝: %s\n" % pdir)
-            sys.stderr.write("   该目录含 %s，是**源材料目录**，不是人格目录。\n"
-                             % marker)
-            sys.stderr.write("   归属约束：材料归用户，人格归 summon；summon 只读材料。\n")
-            sys.exit(1)
-    if not os.path.isfile(os.path.join(pdir, "SKILL.md")):
-        sys.stderr.write("❌ 拒绝: %s\n" % pdir)
-        sys.stderr.write("   该目录没有 `SKILL.md` —— 人格目录必须含人格本体。\n")
-        sys.exit(1)
-    return slug
-
+# 归属白名单（`check_persona_dir` / `require_text`）来自 `_spec.py`——
+# 与 `feedback_log.py` / `eval_record.py` 共用同一份实现。
 
 def require_text(args, flag, why):
-    v = args.get(flag)
-    if v is None:
-        usage_error("缺少 %s（%s）" % (flag, why))
-    if not isinstance(v, str) or not v.strip():
-        usage_error("%s 必须是**非空字符串**（%s）" % (flag, why))
-    return v.strip()
+    return _require_text(args, flag, why, usage_error)
 
 
 # --------------------------------------------------------------------------
@@ -239,7 +201,7 @@ def norm(s):
 
 
 # --------------------------------------------------------------------------
-# 建档（calibration.md §三 模板）
+# 建档（roster-format.md §5.4 格式）
 # --------------------------------------------------------------------------
 
 def ground_truth_line(fm, pdir, source_root, slug):
@@ -325,11 +287,11 @@ def cmd_add(args):
     sec = parse_sections(text)
     rows = active_rows(text)
 
-    # 上限（calibration.md §五）
+    # 上限（roster-format.md §5.4）
     if len(rows) >= ACTIVE_LIMIT:
         sys.stderr.write("❌ 拒绝追加：「生效中」已有 %d 条，达到上限 %d。\n"
                          % (len(rows), ACTIVE_LIMIT))
-        sys.stderr.write("   calibration.md §五：条目累计 > %d 条 → **停止追加**——\n"
+        sys.stderr.write("   roster-format.md §5.4：条目累计 > %d 条 → **停止追加**——\n"
                          % ACTIVE_LIMIT)
         sys.stderr.write("   说明根因在档案或人格本身，**该重铸了**，不是继续打补丁。\n")
         sys.stderr.write("   先 revoke 根因已消失的条目，或重铸人格后逐条重判。\n")
@@ -358,8 +320,8 @@ def cmd_add(args):
     text = set_meta(text, get_rounds(text) + 1, today)
 
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        # 原子写：整文件重写，中途崩溃会截断 CALIBRATION.md、清空全部校准历史
+        write_text_atomic(path, text)
     except OSError as e:
         usage_error("写入失败: %s" % e)
 
@@ -415,8 +377,8 @@ def cmd_revoke(args):
     text = set_meta(text, get_rounds(text) + 1, today)
 
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        # 原子写：整文件重写，中途崩溃会截断 CALIBRATION.md、清空全部校准历史
+        write_text_atomic(path, text)
     except OSError as e:
         usage_error("写入失败: %s" % e)
 
@@ -424,7 +386,7 @@ def cmd_revoke(args):
     print("   原动作: %s" % action)
     print("   撤销理由: %s" % reason)
     print("   生效中剩余 %d 条 · 已撤销 %d 条" % (len(remaining), len(revoked)))
-    print("   ℹ️  若根因是档案已更新，请重铸后逐条重判其余条目（calibration.md §五）。")
+    print("   ℹ️  若根因是档案已更新，请重铸后逐条重判其余条目（roster-format.md §5.4）。")
 
 
 def cmd_list(args):
@@ -493,7 +455,7 @@ def main():
     if not argv:
         usage_error("缺少子命令")
 
-    parser = _Parser(prog="calibrate.py", add_help=False)
+    parser = usage_parser("calibrate.py", usage=USAGE, add_help=False)
     sub = parser.add_subparsers(dest="cmd")
 
     p_add = sub.add_parser("add", add_help=False)

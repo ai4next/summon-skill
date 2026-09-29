@@ -136,9 +136,14 @@ class TestForgeScaffold(Base):
         p = os.path.join(self.tmp, "material", "c", "MATERIAL.md")
         write(p, "---\nslug: c\ntitle: c\nconfidence: high\ngaps: []\n---\n"
                  "## 心智模型 / 核心骨架\n### m\nx\n")
-        rc, so, se = run("forge_scaffold.py", p, "--out", os.path.join(self.tmp, "skills", "c-persona"))
+        out = os.path.join(self.tmp, "skills", "c-persona")
+        rc, so, se = run("forge_scaffold.py", p, "--out", out)
         self.assertEqual(rc, 0, se)
         self.assertNotIn("Traceback", se)
+        # 不只「没崩」：坏形状必须被当成「不知道」，而不是被当成 0%
+        text = read(os.path.join(out, "SKILL.md"))
+        self.assertIn("一手占比 ?%", text)
+        self.assertNotIn("一手占比 0%", text)
 
     def test_missing_confidence_reports_unknown_not_zero(self):
         """回归 F3：无 confidence 时曾谎报「一手占比 0%」。"""
@@ -341,6 +346,8 @@ class TestRoster(Base):
         rc, so, se = self._run()
         self.assertEqual(rc, 0, se)
         self.assertNotIn("Traceback", se)
+        # 坏行被跳过，好行仍然被计入——只断言「没崩」会漏掉「整份文件被丢弃」
+        self.assertIn("人格缺陷 1 条", so)
 
     def test_substring_trigger_overlap_detected(self):
         """回归 R8：子串重叠（「芒格」⊂「用芒格的视角」）曾检不出。"""
@@ -580,14 +587,18 @@ class TestEvalRecord(Base):
         f = self._f()
         write(f, "123\n" + self._rec() + "\n")
         rc, so, se = run("eval_record.py", "history", "--file", f)
+        self.assertEqual(rc, 0, se)
         self.assertNotIn("Traceback", se)
+        self.assertIn("生成力", so)          # 好行仍然被读出来并渲染成表
 
     def test_string_scorers_does_not_crash(self):
         """回归 E1：`scorers: "2"` 曾 TypeError。"""
         rec = json.loads(self._rec())
         rec["scorers"] = "2"
         rc, so, se = self._record(rec)
+        self.assertEqual(rc, 0, se)
         self.assertNotIn("Traceback", se)
+        self.assertIn("scorers=2", so)        # 字符串 "2" 被正确当成 2
 
     def test_history_prints_four_axes_separately(self):
         """四轴必须分开报；脚本绝不把四个数相加（20+18+12+15=65 ≠ total 82）。"""
@@ -826,6 +837,102 @@ class TestGenericInput(Base):
         self.assertNotIn("缺必填字段", so)
         self.assertNotIn("建议重铸", so)
         self.assertIn("漂移检测对该人格不可用", so)
+
+
+class TestGuards(Base):
+    """写边界 / 命名契约 / 原子写 / 编码 —— 每一条都是审计发现的真实缺陷。"""
+
+    # -------------------------------------------------- forge_scaffold
+
+    def test_out_must_end_with_persona_suffix(self):
+        """`--out` 不以 `-persona` 结尾 → 拒绝。
+
+        否则会铸出一个 **roster.py 扫不到、feedback_log / calibrate 拒写** 的产物——
+        全工具链都不认它，而此前没有任何警告。
+        """
+        src = make_material(self.tmp, "m")
+        rc, _, se = run("forge_scaffold.py", src, "--out", os.path.join(self.tmp, "skills", "munger"))
+        self.assertEqual(rc, 1)
+        self.assertIn("-persona", se)
+
+    def test_archetype_requires_axioms(self):
+        """合成型不给 `--axioms` → 拒绝（那个组合必然过不了 P5 静态质检）。"""
+        rc, _, se = run("forge_scaffold.py", "--source-desc", "口述", "--slug", "x",
+                        "--out", os.path.join(self.tmp, "skills", "x-persona"),
+                        "--type", "archetype")
+        self.assertEqual(rc, 1)
+        self.assertIn("--axioms", se)
+
+    def test_unknown_flag_exits_one_not_two(self):
+        """argparse 的 usage 错误统一 exit 1（默认是 2，与其余脚本不一致）。"""
+        rc, _, se = run("forge_scaffold.py", "--nope")
+        self.assertEqual(rc, 1, se)
+
+    def test_no_temp_files_left_behind(self):
+        """原子写不得留下临时文件。"""
+        src = make_material(self.tmp, "m")
+        out = os.path.join(self.tmp, "skills", "m-persona")
+        rc, _, se = run("forge_scaffold.py", src, "--out", out)
+        self.assertEqual(rc, 0, se)
+        leftovers = [n for n in os.listdir(out) if n.startswith(".") and ".tmp." in n]
+        self.assertEqual(leftovers, [])
+
+    # -------------------------------------------------- eval_record 写边界
+
+    def test_refuses_to_write_into_material_dir(self):
+        """`eval_record --file` 曾可写进用户的材料目录（唯一的硬写边界上的洞）。"""
+        mat = os.path.join(self.tmp, "material", "munger")
+        write(os.path.join(mat, "MATERIAL.md"), "x")
+        target = os.path.join(mat, "EVALS.jsonl")
+        rc, _, se = run("eval_record.py", "record", "--file", target,
+                        "--json", json.dumps({"axes": DEFAULT_AXES}))
+        self.assertEqual(rc, 1)
+        self.assertIn("拒绝写入", se)
+        self.assertFalse(os.path.exists(target))
+
+    def test_allows_writing_outside_material_dir(self):
+        """非材料目录（如临时路径）仍然可写——边界只挡材料目录。"""
+        target = os.path.join(self.tmp, "plain", "EVALS.jsonl")
+        rc, _, se = run("eval_record.py", "record", "--file", target,
+                        "--json", json.dumps({"version": 1, "artifact_sha256": "a" * 64,
+                                              "total": DEFAULT_TOTAL, "axes": DEFAULT_AXES,
+                                              "models": {"answer": "a", "score": "b"},
+                                              "scorers": 2,
+                                              "questions": [{"id": "q1", "kind": "known"}]}))
+        self.assertEqual(rc, 0, se)
+        self.assertTrue(os.path.isfile(target))
+
+    # -------------------------------------------------- 编码
+
+    def test_non_utf8_skill_md_fails_cleanly(self):
+        """非 UTF-8 的 SKILL.md 曾以裸 traceback 崩掉（`UnicodeDecodeError` 不是 `OSError`）。"""
+        p = os.path.join(self.tmp, "bad-persona", "SKILL.md")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(b"\xff\xfe---\nname: x\n---\n# bad\n")
+        rc, so, se = run("fidelity_check.py", p)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("Traceback", se)
+        self.assertIn("UTF-8", se)
+
+    # -------------------------------------------------- roster 漂移状态
+
+    def test_missing_material_downgrades_status_but_does_not_claim_stale(self):
+        """根找不到 → 漂移 `unknown`（不谎报「已漂移」），但**有效状态降为 stale**。
+
+        旧行为：报 `unknown` 却**不降级** → 根已消失的「孤儿人格」永远挂在 `active`。
+        """
+        src = make_material(self.tmp, "p")
+        make_persona(self.tmp, "p-persona", material_sha=sha256_of(src),
+                     fidelity_md=TestRoster.NEW)
+        os.remove(src)
+        rc, so, _ = run("roster.py", "--skills-dir", os.path.join(self.tmp, "skills"),
+                        "--source-dir", os.path.join(self.tmp, "material"))
+        self.assertEqual(rc, 0)
+        self.assertIn("无法核对", so)
+        self.assertNotIn("建议重铸", so)              # 不谎报「检测到漂移」
+        self.assertIn("状态降级", so)                  # 但有效状态必须降下来
+        self.assertIn("| stale |", so)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ source_material: null
 source_material_sha256: null
 source_material_version: null
 source_axioms: references/AXIOMS.md
-source_axioms_sha256: 2e016e889896f0721f258cf262671594df5951dcf180389c69131b51a52cf277
+source_axioms_sha256: 5191f8823c129d7c9256cecce9fb2f541668e5a9e6eda3348beab1e342277fbf
 axes: {生成力: 23, 自洽性: 22, 辨识度: 17, 溯源: 20, total: 82, grade: B, mode: full, date: 2026-09-22}
 updated: 2026-09-22
 triggers: [用CFO的视角, 财务视角看看, 怀疑论CFO, 让CFO算算这笔账, CFO会怎么看]
@@ -296,4 +296,4 @@ status: active
 ---
 
 > 本Skill由 [拘神 · summon-skill](https://github.com/ai4next/summon-skill) 铸造（合成型示例）
-> ground truth：`references/AXIOMS.md` @ sha256 4baf96…
+> ground truth：`references/AXIOMS.md` @ sha256 5191f882…

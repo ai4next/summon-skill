@@ -8,14 +8,20 @@ on:
 
 jobs:
   check:
-    name: 自检 + 测试
+    name: 自检 + 测试 (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 本仓库只用标准库，但**开发机常比 CI 新**——只跑一个版本会漏掉
+        # 「本地绿、CI 红」与「CI 绿、本地红」两个方向的问题。
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: 语法检查（全部脚本可编译）
         run: |
@@ -25,17 +31,11 @@ jobs:
       - name: 单元测试
         run: python3 -m unittest discover -s tests -v
 
-      - name: 仓库自检（文档 ↔ 脚本一致性）
+      # 仓库自检覆盖了「脚本 --help 支持」（含 stdout 非空的断言）——
+      # 这里不再重复一遍循环。此前 CI 的循环只看退出码、且跳过规则与自检不同，
+      # 两套策略已经分叉：`_material.py --help` 空输出能被 CI 放过，自检则根本不看。
+      - name: 仓库自检（文档 ↔ 脚本一致性，十五项）
         run: python3 scripts/selfcheck.py
 
       - name: 示例人格静态质检
         run: python3 scripts/fidelity_check.py examples/skeptic-cfo-persona/SKILL.md
-
-      - name: 全部脚本支持 --help
-        run: |
-          set -e
-          for s in scripts/*.py; do
-            case "$s" in */_yaml_subset.py) continue;; esac
-            python3 "$s" --help > /dev/null
-            echo "✅ $s --help"
-          done

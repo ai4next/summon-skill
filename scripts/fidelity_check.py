@@ -46,34 +46,48 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _yaml_subset import (  # noqa: E402
     parse_frontmatter, as_list, as_str, as_int, as_dict, is_null, section,
-    sha256_file,
+    sha256_file, read_text,
 )
 from _material import (  # noqa: E402
-    FIELD_SOURCE, SOURCE_DIR_DEFAULT, material_path as resolve_material_path,
+    FIELD_SOURCE, SOURCE_DIR_DEFAULT, MATERIAL_MARKERS,
+    material_path as resolve_material_path,
+)
+from _spec import (  # noqa: E402
+    ANTI_PATTERN_MIN, AXES, DESC_MAX, DESC_WARN, HEURISTIC_COUNT,
+    HONEST_BOUNDARY_MIN, MODEL_COUNT, TENSION_MIN_GATE, TENSION_MIN_TARGET,
+    make_usage_error, resolve_axioms_path,
 )
 
 PASS, WARN, FAIL = "pass", "warn", "fail"
 LABEL = {PASS: "✅ PASS", WARN: "⚠️  WARN", FAIL: "❌ FAIL"}
 
-#: 四轴（名称, 满分）——`fidelity-scorecard.md` §零
-AXES = (("生成力", 30), ("自洽性", 25), ("辨识度", 20), ("溯源", 25))
+#: 四轴（`AXES`）、计数门槛、长度上限、张力门禁全部来自 `_spec.py`（唯一实现）。
+#: 本文件只负责「怎么查」，不负责「门槛是多少」——复制是漂移的根因。
 
 #: 表达DNA 六项（canonical source：persona-forge.md §二.4）
 DNA_SIX = ("句式", "词汇", "节奏", "幽默", "确定性", "引用")
 
-#: 闭包边界 / 结构性沉默标记（公理 5）
+#: 闭包边界 / 结构性沉默标记（公理 5）——用于在**源材料**里找沉默声明
 CLOSURE_MARKS = ("结构性沉默", "闭包边界", "本质无立场", "主动不公开",
                  "主动不表态", "faithful_silence")
+
+#: 「诚实边界」段内的**段首引导词**：`**信息缺口**（…）：` 这种加粗小标题。
+#: 只看段首，不看正文里随口提到的词——否则「分开写」这个要求形同虚设。
+_BOLD_LEAD_RE = re.compile(r"^\s*\*\*([^*\n]+)\*\*", re.M)
+
+#: 闭包边界段的引导词（`faithful_silence` / `主动不公开` 是正文用语，不做引导词）
+CLOSURE_LEAD_MARKS = ("结构性沉默", "闭包边界", "本质无立场")
 
 #: `src:` 行
 SRC_RE = re.compile(r"(?:\*\*)?\s*src\s*(?:\*\*)?\s*[:：]\s*(.+)", re.I)
 
-#: 推导链里可被「点名」的对象：模型 / 启发式 / 公理（合成型的 ground truth 是公理集）
+#: 推导链里可被「点名」的对象：模型 / 启发式 / 公理（合成型的 ground truth 是公理集）。
+#: ⚠️ **裸词「公理集」不算点名**——「由公理集推出」这种写法没有指向任何具体一条，
+#: 它正是公理 2.3 要拦的「标了推断却点不出名字」。必须写出 `公理 A2` / `A2` / `模型3`。
 NAMED_RE = re.compile(
     r"模型\s*[0-9一二三四五六七八九十]+"
     r"|启发式\s*[0-9一二三四五六七八九十]+"
     r"|公理\s*[A-Za-z]?\s*[0-9一二三四五六七八九十]+"
-    r"|公理集"
     r"|(?<![A-Za-z0-9])[Aa]\s*\d+"
     r"|(?<![A-Za-z0-9])[mM]\s*\d+"
     r"|(?<![A-Za-z0-9])[hH]\s*\d+"
@@ -83,11 +97,9 @@ NAMED_RE = re.compile(
 # 基础工具
 # --------------------------------------------------------------------------
 
-def usage_error(msg):
-    """参数 / 文件错误：**stderr** + 退出码 1。"""
-    sys.stderr.write("❌ " + msg + "\n")
-    sys.stderr.write("用法: python3 fidelity_check.py <persona SKILL.md 路径> [--source-dir DIR]\n")
-    sys.exit(1)
+#: 参数 / 文件错误：**stderr** + 退出码 1（实现见 `_spec.make_usage_error`）
+usage_error = make_usage_error(
+    "用法: python3 fidelity_check.py <persona SKILL.md 路径> [--source-dir DIR]")
 
 
 def _sec(body, *titles):
@@ -170,6 +182,15 @@ def _table_data_rows(sec):
     return out
 
 
+def _table_head(sec):
+    """表格的表头行文本（分隔行之前那一行）；没有表格 → None。"""
+    lines = [l.strip() for l in (sec or "").splitlines() if l.strip().startswith("|")]
+    for i, l in enumerate(lines):
+        if re.match(r"^\|[\s:|-]+\|$", l):
+            return lines[i - 1] if i > 0 else None
+    return None
+
+
 def _table_src_column(sec):
     """若表格有 `src` 列，返回其列号；否则 None。"""
     lines = [l.strip() for l in (sec or "").splitlines() if l.strip().startswith("|")]
@@ -242,7 +263,8 @@ def _short(s, n=24):
 
 def load_material(fm, source_dir):
     """→ ctx dict（gaps / material_silence / material_skipped / material_path）。"""
-    ctx = {"gaps": [], "material_silence": False, "material_skipped": None, "material_path": None}
+    ctx = {"gaps": [], "material_silence": False, "material_skipped": None,
+           "material_path": None, "material_declared": False}
     if fm is None:
         ctx["material_skipped"] = "无 frontmatter"
         return ctx
@@ -253,6 +275,8 @@ def load_material(fm, source_dir):
     if not slug:
         ctx["material_skipped"] = "无 source_material（合成型以公理集 references/AXIOMS.md 为 ground truth）"
         return ctx
+    # 声明了来源 —— 之后若核对不了，必须如实报「无法核对」，不能静默 PASS
+    ctx["material_declared"] = True
     path = resolve_material_path(source_dir, slug)
     if not path:
         # 输入是通用的：材料可以只是一段粘贴的文本，不一定在磁盘上留下文件
@@ -260,8 +284,7 @@ def load_material(fm, source_dir):
                                    % os.path.join(source_dir, slug))
         return ctx
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
+        text = read_text(path)
     except OSError as e:
         ctx["material_skipped"] = "源材料读取失败: %s" % e
         return ctx
@@ -280,37 +303,7 @@ def load_material(fm, source_dir):
 # --------------------------------------------------------------------------
 # 公理集（合成型的 ground truth）
 # --------------------------------------------------------------------------
-
-def resolve_axioms_path(fm, persona_dir, source_root, slug):
-    """合成型的 `source_axioms` → 实际文件路径。
-
-    解析顺序（`persona-forge.md` §七：公理集惯例放在**人格目录自己的**
-    `references/AXIOMS.md`，人格目录因此自包含、可迁移）：
-      1. 绝对路径
-      2. 含 `/` 或以 `.md` 结尾 → 相对**人格目录**
-      3. slug 形式 → `<人格目录>/references/AXIOMS.md` → `<档案根>/<slug>/AXIOMS.md` → `<人格目录>/<slug>`
-      4. 兜底：即使 frontmatter 没写，人格目录下的 `references/AXIOMS.md` 也算数
-    """
-    raw = as_str(fm.get("source_axioms"))
-    conv = os.path.join(persona_dir, "references", "AXIOMS.md")
-    candidates = []
-    if raw:
-        if os.path.isabs(raw):
-            candidates.append(raw)
-        elif "/" in raw or raw.endswith(".md"):
-            candidates.append(os.path.join(persona_dir, raw))
-        else:
-            candidates += [conv,
-                           os.path.join(source_root, raw, "AXIOMS.md"),
-                           os.path.join(persona_dir, raw)]
-    if os.path.isfile(conv):
-        candidates.append(conv)
-    if not candidates:
-        return None
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return candidates[0]
+# `resolve_axioms_path` 来自 `_spec.py`（与 roster.py 共用同一份实现）。
 
 
 # --------------------------------------------------------------------------
@@ -342,7 +335,7 @@ def check_roster_fields(fm, body, ctx):
     """名册必填字段（roster-format.md §四）。
 
     v3：`axes`（四轴内联映射）取代 v2 的 `fidelity` / `generativity`。
-    合成型的 ground truth 是公理集（`persona-forge.md` §七.3），漂移依据是
+    合成型的 ground truth 是公理集（`persona-forge.md` §3.1），漂移依据是
     `source_axioms_sha256`；此时 `source_material_version` 槽位不适用。
     """
     if fm is None:
@@ -385,11 +378,11 @@ def check_description(fm, body, ctx):
     if not d or not d.strip():
         return FAIL, "缺少 description（frontmatter 必填）"
     n = len(d)
-    if n > 1024:
-        return FAIL, "description %d 字（>1024 硬上限；且抬高误触发率）" % n
-    if n > 500:
-        return WARN, "description %d 字（>500；目标约 300 字）" % n
-    return PASS, "description %d 字（≤500）" % n
+    if n > DESC_MAX:
+        return FAIL, "description %d 字（>%d 硬上限；且抬高误触发率）" % (n, DESC_MAX)
+    if n > DESC_WARN:
+        return WARN, "description %d 字（>%d；目标约 300 字）" % (n, DESC_WARN)
+    return PASS, "description %d 字（≤%d）" % (n, DESC_WARN)
 
 
 def check_models(fm, body, ctx):
@@ -404,10 +397,11 @@ def check_models(fm, body, ctx):
             return FAIL, ("核心心智模型下只有 %d 条列表项、无 `### 模型N:` 小节——"
                           "纯 bullet 不算心智模型" % len(bullets))
         return FAIL, "核心心智模型下没有任何 `###` 模型小节"
-    if n < 3:
-        return FAIL, "心智模型仅 %d 个（需 3-7）" % n
-    if n > 7:
-        return FAIL, "心智模型 %d 个（>7，没取舍）" % n
+    lo, hi = MODEL_COUNT
+    if n < lo:
+        return FAIL, "心智模型仅 %d 个（需 %d-%d）" % (n, lo, hi)
+    if n > hi:
+        return FAIL, "心智模型 %d 个（>%d，没取舍）" % (n, hi)
     return PASS, "%d 个心智模型（`###` 小节）" % n
 
 
@@ -428,17 +422,43 @@ def check_limitations(fm, body, ctx):
 
 
 def check_heuristics(fm, body, ctx):
+    """决策启发式：5-10 条，且**每条都要有失效条件**。
+
+    失效条件是硬要求（`persona-forge.md` §2.2：「只给规则不给失效条件的启发式，
+    是鸡汤不是启发式」），旧实现只数条数——文档却写着「`fidelity_check.py` 会核」。
+    这里把它补上。
+    """
     sec = _sec(body, "决策启发式")
     if sec is None:
         return FAIL, "缺少「决策启发式」段——认知层不完整"
-    n = len(_list_items(sec))
-    if n == 0:
-        n = len(_table_data_rows(sec))
-    if n < 5:
-        return FAIL, "决策启发式仅 %d 条（需 5-10）" % n
-    if n > 10:
-        return FAIL, "决策启发式 %d 条（>10，没取舍）" % n
-    return PASS, "%d 条决策启发式" % n
+    items = _list_items(sec)
+    table_form = False
+    if not items:
+        table_form = True
+        rows = _table_data_rows(sec)
+        items = [" | ".join(r) for r in rows]
+    n = len(items)
+    lo, hi = HEURISTIC_COUNT
+    if n < lo:
+        return FAIL, "决策启发式仅 %d 条（需 %d-%d）" % (n, lo, hi)
+    if n > hi:
+        return FAIL, "决策启发式 %d 条（>%d，没取舍）" % (n, hi)
+
+    if table_form:
+        # 表格形态：表头里应当有「反例 / 失效条件」列
+        head = _table_head(sec) or ""
+        if not re.search(r"失效|反例|不适用|例外", head):
+            return FAIL, ("决策启发式表格缺「失效条件 / 反例」列——"
+                          "只给规则不给失效条件的启发式是鸡汤")
+        return PASS, "%d 条决策启发式（表格形态，含失效条件列）" % n
+
+    missing = [str(i) for i, t in enumerate(items, 1)
+               if not re.search(r"失效|反例|不适用|例外|不成立", t)]
+    if missing:
+        return FAIL, ("决策启发式缺失效条件: 第 %s 条 —— 只给规则不给失效条件的"
+                      "启发式是鸡汤不是启发式（`persona-forge.md` §2.2）"
+                      % "、".join(missing))
+    return PASS, "%d 条决策启发式，均带失效条件" % n
 
 
 def check_identity(fm, body, ctx):
@@ -475,9 +495,9 @@ def check_anti_patterns(fm, body, ctx):
     rows = _table_data_rows(_sec(body, "反例黑名单") or "")
     alt = len(_list_items(_sec(body, "反模式") or ""))
     n = max(refused, len(rows), alt)
-    if n < 5:
-        return FAIL, "反模式仅 %d 条（需 ≥5）：我拒绝的 %d 条 · 反例黑名单 %d 行" % (
-            n, refused, len(rows))
+    if n < ANTI_PATTERN_MIN:
+        return FAIL, "反模式仅 %d 条（需 ≥%d）：我拒绝的 %d 条 · 反例黑名单 %d 行" % (
+            n, ANTI_PATTERN_MIN, refused, len(rows))
     return PASS, "反模式 %d 条（我拒绝的 %d · 反例黑名单 %d 行）" % (n, refused, len(rows))
 
 
@@ -499,14 +519,27 @@ def check_honest_boundary(fm, body, ctx):
         return FAIL, "诚实边界仍是占位符（未映射源档案 gaps）"
     n = max(len(re.findall(r"^\s*(?:[-*+]|\d+\.)\s+\S", sec, re.M)),
             len(_table_data_rows(sec)))
-    if n < 3:
-        return FAIL, "诚实边界仅 %d 条（需 ≥3）" % n
+    if n < HONEST_BOUNDARY_MIN:
+        return FAIL, "诚实边界仅 %d 条（需 ≥%d）" % (n, HONEST_BOUNDARY_MIN)
     return PASS, "%d 条诚实边界" % n
 
 
 def check_gaps_mapping(fm, body, ctx):
-    if ctx.get("material_skipped"):
-        return PASS, "⏭ 跳过：%s" % ctx["material_skipped"]
+    """材料 `gaps` 是否逐条映射进诚实边界。
+
+    ⚠️ **声明了来源却核对不了 → WARN，不是静默 PASS。**
+    旧实现在 `material_skipped` 时无条件 `return PASS`。但「没有 source_material」
+    （合成型 / 零文件输入，本就无需映射）与「**声明了** source_material 却找不到文件」
+    （路径相对铸造时的 cwd 记下、换目录跑就解析不到）是两回事——
+    后者若静默 PASS，溯源 S 的机器代理就变成了空操作，而它看起来是绿的。
+    """
+    skipped = ctx.get("material_skipped")
+    if skipped:
+        if ctx.get("material_declared"):
+            return WARN, ("⚠️ 无法核对 gaps：%s —— 该人格**声明了来源**，"
+                          "但本脚本找不到它。请用 --source-dir 指对目录，"
+                          "否则这一项是空转的（不能当作已核对）" % skipped)
+        return PASS, "⏭ 跳过：%s" % skipped
     gaps = ctx.get("gaps") or []
     if not gaps:
         return PASS, "源档案 gaps 为空，无需映射"
@@ -522,38 +555,58 @@ def check_gaps_mapping(fm, body, ctx):
 
 
 def check_closure_boundary(fm, body, ctx):
-    """公理 5：诚实边界必须把「信息缺口」与「结构性沉默 / 闭包边界」分开写。
+    """公理 5：诚实边界必须把「信息缺口」与「结构性沉默 / 闭包边界」**分成两段**写。
 
     结构性沉默是**正确行为**，不是待补的缺口——把两者混在一起会逼着为沉默编造立场。
     本项为**警告级**（静态近似），最终判据在评分卡「溯源 S · 缺口与边界映射」。
+
+    ⚠️ 旧实现的判据是 `"信息缺口" in sec or "缺口" in sec`——那个 `or "缺口"`
+    让前半几乎恒真，于是「有任意一个闭包标记 + 段里出现过『缺口』」就 PASS。
+    它**没有验证「分开」**，而分开正是这一项存在的唯一理由。
+    现在改为看**段首引导词**（`**信息缺口**…` / `**闭包边界 · 结构性沉默**…`），
+    两者必须各自成段。
     """
     sec = _sec(body, "诚实边界", "Honest Boundary") or ""
-    has_gap = "信息缺口" in sec or "缺口" in sec
-    boundary_marks = any(k in sec for k in CLOSURE_MARKS)
-    if boundary_marks and has_gap:
-        return PASS, "诚实边界已把「信息缺口」与「闭包边界 / 结构性沉默」分开写（公理 5）"
-    if ctx.get("material_silence") and not boundary_marks:
-        return WARN, ("源档案声明了结构性沉默，但诚实边界未单列「闭包边界 / 结构性沉默」"
+    leads = _BOLD_LEAD_RE.findall(sec)
+    gap_lead = any("缺口" in l for l in leads)
+    clo_lead = any(any(k in l for k in CLOSURE_LEAD_MARKS) for l in leads)
+
+    if gap_lead and clo_lead:
+        return PASS, "诚实边界已把「信息缺口」与「闭包边界 / 结构性沉默」分成两段（公理 5）"
+    if clo_lead:
+        return WARN, ("有「闭包边界 / 结构性沉默」段，但没有独立的「信息缺口」段"
+                      "——缺口要补、边界永不补，两者必须分开（公理 5）")
+    if ctx.get("material_silence") and not clo_lead:
+        return WARN, ("源档案声明了结构性沉默，但诚实边界未单列「闭包边界 / 结构性沉默」段"
                       "——沉默不是缺口（公理 5）")
-    if not boundary_marks:
-        return WARN, ("诚实边界未区分「信息缺口」与「结构性沉默 / 闭包边界」——"
+    if gap_lead:
+        return WARN, ("诚实边界只有「信息缺口」段，没有「闭包边界 / 结构性沉默」段——"
                       "合成型须在立公理集时写明「闭包边界」（公理 5）")
-    return WARN, "诚实边界有闭包边界，但未与「信息缺口」分段区分"
+    return WARN, ("诚实边界未把「信息缺口」与「结构性沉默 / 闭包边界」分成两段——"
+                  "两者混写会逼着为刻意沉默的主体编造立场（公理 5）")
 
 
 def check_consistency_structure(fm, body, ctx):
     """自洽性结构（公理 4）：只数「**我自己也没想清楚的**」小节下的结构化条目。
 
-    v3 起门槛为 **≥1 对**显式张力（旧卡是 ≥2）——关键是人格**自己承认**那个冲突，
-    而不是并列摆着两句相反的话。不数散落在全文的「张力 / 矛盾」关键词。
+    门槛分两级（canonical source：`persona-forge.md` §3.3）：
+      · **硬门禁** = `TENSION_MIN_GATE`（1 对）——少于它说明公理集里缺一条真正有代价的立场
+      · **质量目标** = `TENSION_MIN_TARGET`（2 对）——评分卡的满分条件，低于它给 WARN 而非 FAIL
+
+    关键是人格**自己承认**那个冲突，而不是并列摆着两句相反的话。
+    不数散落在全文的「张力 / 矛盾」关键词。
     """
     sec = _sec(body, "价值观与反模式", "内在张力", "矛盾与张力") or body
     m = re.search(r"\*\*我自己也没想清楚的\*\*[^\n]*\n(.*?)(?=\n\*\*|\n##|\Z)", sec, re.S)
     if not m:
         return FAIL, "未检出「我自己也没想清楚的」小节——张力必须写在这里（不数散落关键词）"
     n = len(re.findall(r"^\s*(?:\d+\.|[-*+])\s+\S", m.group(1), re.M))
-    if n < 1:
-        return FAIL, "「我自己也没想清楚的」为空（自洽性要求 ≥1 对显式张力）"
+    if n < TENSION_MIN_GATE:
+        return FAIL, "「我自己也没想清楚的」为空（自洽性要求 ≥%d 对显式张力）" % TENSION_MIN_GATE
+    if n < TENSION_MIN_TARGET:
+        return WARN, ("%d 对未调和张力（硬门禁 ≥%d 已过；**质量目标 ≥%d** 未达——"
+                      "张力通常在 2 对以上才撑得起棱角，评分卡「张力在位」拿不到满分）"
+                      % (n, TENSION_MIN_GATE, TENSION_MIN_TARGET))
     return PASS, "%d 对未调和张力（列于「我自己也没想清楚的」）" % n
 
 
@@ -730,8 +783,7 @@ def main(argv=None):
     if not os.path.isfile(path):
         usage_error("文件不存在: " + path)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
+        text = read_text(path)
     except OSError as e:
         usage_error("读取失败: %s" % e)
 
